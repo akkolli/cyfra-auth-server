@@ -4,10 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.43.0", features = [ "full" ] }
+tokio = { version = "1.43.0", features = ["full"] }
 shared = { path = "../shared" }
 futures-util = "0.3.31"
-tokio-tungstenite = "0.26.1"
-rand = "0.8.5"
 serde = "1.0.217"
 serde_json = "1.0.137"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+warp = "0.3"
+hex = "0.4"
+# Removed ws deps as we are moving to HTTP
+# tokio-tungstenite = "0.26.1"
+rand = "0.8.5"
