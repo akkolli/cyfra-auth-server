@@ -68,6 +68,7 @@ async fn main() {
 }
 
 async fn handle_register_device(req: RegisterDeviceRequest, db: Arc<RwLock<storage::DB>>) -> Result<impl warp::Reply, warp::Rejection> {
+    println!("Recieved register device request for user: {}", req.username);
     // 1. Verify Signature
     let pub_key_bytes = match hex::decode(&req.public_key) {
         Ok(b) => b,
@@ -80,16 +81,32 @@ async fn handle_register_device(req: RegisterDeviceRequest, db: Arc<RwLock<stora
     };
 
     // Construct signed data: register_device|username|client_type|push_token|timestamp
+    // NOTE: Client uses pipe separators!
     let mut signed_data = Vec::new();
-    signed_data.extend_from_slice(b"register_device");
+    signed_data.extend_from_slice(b"register_device|");
     signed_data.extend_from_slice(req.username.as_bytes());
+    signed_data.extend_from_slice(b"|");
     signed_data.extend_from_slice(req.client_type.as_bytes());
+    signed_data.extend_from_slice(b"|");
     signed_data.extend_from_slice(req.push_token.as_bytes());
-    signed_data.extend_from_slice(&req.timestamp.to_le_bytes()); // Assuming LE 64-bit
+    signed_data.extend_from_slice(b"|");
+    
+    // Client signs Date.now() which is milliseconds (u64).
+    // In TS: `const signPayload = ... + timestamp` converts number to string!
+    // Wait, let's double check mobile code.
+    // Mobile: `const signPayload = ...` (template literal) -> timestamp is stringified.
+    // Server currently does: `req.timestamp.to_le_bytes()`. This is WRONG if mobile signs the string representation.
+    // Mobile: `const signPayload = ... ${timestamp}`. Yes, it's string.
+    
+    let timestamp_str = req.timestamp.to_string();
+    signed_data.extend_from_slice(timestamp_str.as_bytes());
 
     if let Err(_) = encryption::verify(&signed_data, &pub_key_bytes, &signature_bytes) {
+         println!("Signature verification failed");
          return Ok(warp::reply::with_status("Invalid signature", warp::http::StatusCode::UNAUTHORIZED));
     }
+    
+    println!("Signature verified successfully");
 
     // 2. Store Token
     let record = PushTokenRecord {
@@ -105,6 +122,7 @@ async fn handle_register_device(req: RegisterDeviceRequest, db: Arc<RwLock<stora
     
     let _ = storage::async_set_value_in_db(&key, &val, db).await;
 
+    println!("Device registered successfully");
     Ok(warp::reply::with_status("Registered", warp::http::StatusCode::OK))
 }
 
