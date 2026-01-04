@@ -63,7 +63,7 @@ async fn main() {
 
     let routes = register_route.or(push_route);
 
-    println!("Auth Server listening on 0.0.0.0:3000");
+    println!("Auth Server listening on 127.0.0.1:3000");
     warp::serve(routes).run(([0, 0, 0, 0], 3000)).await;
 }
 
