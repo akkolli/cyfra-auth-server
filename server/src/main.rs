@@ -1,9 +1,11 @@
 use warp::Filter;
+use warp::ws::{self, WebSocket};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 use shared::{storage, encryption};
 use std::time::{SystemTime, UNIX_EPOCH};
+use futures_util::{StreamExt, SinkExt};
 
 const SERVER_DB_PATH: &str = "./auth_db";
 const MAX_TIMESTAMP_AGE_SECS: u64 = 300; // 5 minutes
@@ -79,9 +81,20 @@ async fn main() {
             handle_push_trigger(req, db, client)
         });
 
-    let routes = register_route.or(push_route);
+    // GET /push_ws — WebSocket channel for push triggers
+    let ws_db = db.clone();
+    let ws_client = client.clone();
+    let push_ws_route = warp::path("push_ws")
+        .and(warp::ws())
+        .map(move |ws: ws::Ws| {
+            let db = ws_db.clone();
+            let client = ws_client.clone();
+            ws.on_upgrade(move |socket| handle_push_ws(socket, db, client))
+        });
 
-    println!("Auth Server listening on 0.0.0.0:3000");
+    let routes = register_route.or(push_route).or(push_ws_route);
+
+    println!("Auth Server listening on 0.0.0.0:3000 (HTTP + WebSocket)");
     warp::serve(routes).run(([0, 0, 0, 0], 3000)).await;
 }
 
@@ -145,37 +158,28 @@ async fn handle_register_device(req: RegisterDeviceRequest, db: Arc<RwLock<stora
     Ok(warp::reply::with_status("Registered", warp::http::StatusCode::OK))
 }
 
-async fn handle_push_trigger(req: PushTriggerRequest, db: Arc<RwLock<storage::DB>>, client: reqwest::Client) -> Result<impl warp::Reply, warp::Rejection> {
-    // Reject stale or future timestamps to prevent replay attacks
+/// Core push trigger logic shared by HTTP and WebSocket handlers.
+/// Returns Ok("Triggered") on success, Err(message) on failure.
+async fn process_push_trigger(req: PushTriggerRequest, db: Arc<RwLock<storage::DB>>, client: reqwest::Client) -> Result<String, String> {
     if !is_timestamp_fresh(req.timestamp) {
-        return Ok(warp::reply::with_status("Timestamp too old or too far in the future", warp::http::StatusCode::BAD_REQUEST));
+        return Err("Timestamp too old or too far in the future".into());
     }
 
-    let sender_pub_key_bytes = match hex::decode(&req.sender_pub_key) {
-        Ok(b) => b,
-        Err(_) => return Ok(warp::reply::with_status("Invalid hex for sender_pub_key", warp::http::StatusCode::BAD_REQUEST)),
-    };
+    let sender_pub_key_bytes = hex::decode(&req.sender_pub_key)
+        .map_err(|_| "Invalid hex for sender_pub_key".to_string())?;
+    let signed_ts_bytes = hex::decode(&req.signed_timestamp)
+        .map_err(|_| "Invalid hex for signed_timestamp".to_string())?;
+    let recipient_pub_key_bytes = hex::decode(&req.recipient_pub_key)
+        .map_err(|_| "Invalid hex for recipient_pub_key".to_string())?;
 
-    let signed_ts_bytes = match hex::decode(&req.signed_timestamp) {
-        Ok(b) => b,
-        Err(_) => return Ok(warp::reply::with_status("Invalid hex for signed_timestamp", warp::http::StatusCode::BAD_REQUEST)),
-    };
-
-    let recipient_pub_key_bytes = match hex::decode(&req.recipient_pub_key) {
-        Ok(b) => b,
-        Err(_) => return Ok(warp::reply::with_status("Invalid hex for recipient_pub_key", warp::http::StatusCode::BAD_REQUEST)),
-    };
-
-    // Verify signature over: timestamp_u64_le_bytes + recipient_pub_key_bytes
     let mut verification_buffer = Vec::new();
     verification_buffer.extend_from_slice(&req.timestamp.to_le_bytes());
     verification_buffer.extend_from_slice(&recipient_pub_key_bytes);
 
     if encryption::verify(&verification_buffer, &sender_pub_key_bytes, &signed_ts_bytes).is_err() {
-        return Ok(warp::reply::with_status("Invalid signed_timestamp", warp::http::StatusCode::UNAUTHORIZED));
+        return Err("Invalid signed_timestamp".into());
     }
 
-    // Lookup Recipient Token
     let key = [recipient_pub_key_bytes, b"push_token".to_vec()].concat();
 
     if let Ok(Some(val)) = storage::async_get_value_from_db(&key, db).await {
@@ -186,12 +190,62 @@ async fn handle_push_trigger(req: PushTriggerRequest, db: Arc<RwLock<storage::DB
                         eprintln!("Failed to send push notification: {}", e);
                     }
                 });
-                return Ok(warp::reply::with_status("Triggered", warp::http::StatusCode::OK));
+                return Ok("Triggered".into());
             }
         }
     }
 
-    Ok(warp::reply::with_status("Recipient not found or disabled", warp::http::StatusCode::NOT_FOUND))
+    Err("Recipient not found or disabled".into())
+}
+
+async fn handle_push_trigger(req: PushTriggerRequest, db: Arc<RwLock<storage::DB>>, client: reqwest::Client) -> Result<impl warp::Reply, warp::Rejection> {
+    match process_push_trigger(req, db, client).await {
+        Ok(msg) => Ok(warp::reply::with_status(msg, warp::http::StatusCode::OK)),
+        Err(msg) => Ok(warp::reply::with_status(msg, warp::http::StatusCode::BAD_REQUEST)),
+    }
+}
+
+async fn handle_push_ws(ws: WebSocket, db: Arc<RwLock<storage::DB>>, client: reqwest::Client) {
+    println!("WebSocket push client connected");
+    let (mut tx, mut rx) = ws.split();
+
+    while let Some(result) = rx.next().await {
+        let msg = match result {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("WebSocket read error: {}", e);
+                break;
+            }
+        };
+
+        if msg.is_close() {
+            break;
+        }
+
+        let text = match msg.to_str() {
+            Ok(t) => t.to_string(),
+            Err(_) => continue, // skip non-text frames
+        };
+
+        let req: PushTriggerRequest = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(ws::Message::text(format!("error: bad json: {}", e))).await;
+                continue;
+            }
+        };
+
+        let response = match process_push_trigger(req, db.clone(), client.clone()).await {
+            Ok(msg) => msg,
+            Err(msg) => format!("error: {}", msg),
+        };
+
+        if tx.send(ws::Message::text(response)).await.is_err() {
+            break; // client gone
+        }
+    }
+
+    println!("WebSocket push client disconnected");
 }
 
 async fn send_expo_push(client: &reqwest::Client, token: &str, title: &str, body: &str) -> Result<(), reqwest::Error> {
